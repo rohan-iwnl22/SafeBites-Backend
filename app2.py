@@ -5,7 +5,6 @@ import numpy as np
 import re
 from flask import Flask, request, jsonify
 from fuzzywuzzy import process
-from collections import defaultdict
 
 app = Flask(__name__)
 
@@ -46,11 +45,17 @@ def correct_text(text, additives_dict):
     corrected_words = []
     
     for word in words:
+        # If word already exists in additives, keep it
+        if word in additives_dict:
+            corrected_words.append(word)
+            continue  # Skip fuzzy matching
+
+        # Try fuzzy match only if word is significantly different
         match, score = process.extractOne(word, additives_dict.keys())
-        if score > 80:  # Confidence threshold
+        if score > 90:  # Only replace if confidence is very high
             corrected_words.append(match)
         else:
-            corrected_words.append(word)
+            corrected_words.append(word)  # Keep original if no strong match
     
     return ' '.join(corrected_words)
 
@@ -60,7 +65,15 @@ def detect_additives(text, additives_dict):
     
     for additive in additives_dict.keys():
         if additive in text:
-            detected_additives.append({'additive': additive, 'max_level': additives_dict[additive]})
+            # Extract numeric level from text (if present)
+            match = re.search(rf"{additive}\s*(\d+\.?\d*)", text)
+            detected_level = match.group(1) if match else "Not found"
+
+            detected_additives.append({
+                'additive': additive,
+                'detected_level': detected_level,
+                'max_level': additives_dict[additive]
+            })
     
     return detected_additives
 
@@ -69,14 +82,23 @@ def analyze_additives(detected_list):
         return {'count': 0, 'gmp_count': 0, 'numeric_levels': [], 'categories': {}}
 
     gmp_count = sum(1 for item in detected_list if item['max_level'] == 'GMP')
-    numeric_levels = [float(re.search(r'(\d+(?:\.\d+)?)', str(item['max_level'])).group(1)) for item in detected_list if item['max_level'] != 'GMP' and re.search(r'\d+', str(item['max_level']))]
+    
+    numeric_levels = []
+    for item in detected_list:
+        # Extract numeric values from detected levels
+        if item['detected_level'] != "Not found":
+            try:
+                numeric_levels.append(float(item['detected_level']))
+            except ValueError:
+                pass  # Ignore non-numeric values
 
     return {
         'count': len(detected_list),
         'gmp_count': gmp_count,
         'numeric_levels': numeric_levels,
         'avg_level': np.mean(numeric_levels) if numeric_levels else 0,
-        'max_level': max(numeric_levels) if numeric_levels else 0
+        'max_level': max(numeric_levels) if numeric_levels else 0,
+        'detailed_levels': detected_list  # Includes detected & max levels
     }
 
 @app.route('/extract', methods=['POST'])
@@ -92,10 +114,11 @@ def extract_text():
     reader = easyocr.Reader(['en'])
     results = reader.readtext(file_path, detail=0)
     extracted_text = ' '.join(results)
-
+    
     print(f"Extracted Text: {extracted_text}")
+    
     corrected_text = correct_text(extracted_text, ENHANCED_DICT)
-    print(f"corrected Text: {corrected_text}")
+    print(f"Corrected Text: {corrected_text}")
 
     # Auto-send to analysis
     response = analyze_text(corrected_text)

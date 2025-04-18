@@ -3,15 +3,28 @@ import easyocr
 import pandas as pd
 import numpy as np
 import re
+import os
 from flask import Flask, request, jsonify
 from fuzzywuzzy import process
+from flask_cors import CORS, cross_origin
+from werkzeug.utils import secure_filename
 
 app = Flask(__name__)
+CORS(app)  # Enable CORS for all routes
+
+# Configuration
+UPLOAD_FOLDER = 'uploads'
+ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif'}
+app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 
 # Load and preprocess additives dataset
 ADDATIVES_CSV = "LAST_FINAL_1.csv"  # Replace with actual path
 ADDATIVES_DF, ADDITIVES_DICT = None, None
 ENHANCED_DICT = {}
+
+def allowed_file(filename):
+    return '.' in filename and \
+           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 def clean_dataset(filepath):
     df = pd.read_csv(filepath)
@@ -45,17 +58,15 @@ def correct_text(text, additives_dict):
     corrected_words = []
     
     for word in words:
-        # If word already exists in additives, keep it
         if word in additives_dict:
             corrected_words.append(word)
-            continue  # Skip fuzzy matching
+            continue
 
-        # Try fuzzy match only if word is significantly different
         match, score = process.extractOne(word, additives_dict.keys())
-        if score > 90:  # Only replace if confidence is very high
+        if score > 90:
             corrected_words.append(match)
         else:
-            corrected_words.append(word)  # Keep original if no strong match
+            corrected_words.append(word)
     
     return ' '.join(corrected_words)
 
@@ -65,7 +76,6 @@ def detect_additives(text, additives_dict):
     
     for additive in additives_dict.keys():
         if additive in text:
-            # Extract numeric level from text (if present)
             match = re.search(rf"{additive}\s*(\d+\.?\d*)", text)
             detected_level = match.group(1) if match else "Not found"
 
@@ -85,12 +95,11 @@ def analyze_additives(detected_list):
     
     numeric_levels = []
     for item in detected_list:
-        # Extract numeric values from detected levels
         if item['detected_level'] != "Not found":
             try:
                 numeric_levels.append(float(item['detected_level']))
             except ValueError:
-                pass  # Ignore non-numeric values
+                pass
 
     return {
         'count': len(detected_list),
@@ -98,46 +107,89 @@ def analyze_additives(detected_list):
         'numeric_levels': numeric_levels,
         'avg_level': np.mean(numeric_levels) if numeric_levels else 0,
         'max_level': max(numeric_levels) if numeric_levels else 0,
-        'detailed_levels': detected_list  # Includes detected & max levels
+        'detailed_levels': detected_list
     }
 
 @app.route('/extract', methods=['POST'])
+@cross_origin()
 def extract_text():
-    print("Request files:", request.files)
-    file = request.files.get("image")
-    if not file:
-        return jsonify({"error": "No image provided"}), 400
-
-    file_path = "temp.jpg"
-    file.save(file_path)
-
-    reader = easyocr.Reader(['en'])
-    results = reader.readtext(file_path, detail=0)
-    extracted_text = ' '.join(results)
+    print("Request received at /extract")
+    print("Files in request:", list(request.files.keys()))
+    print("Form data keys:", list(request.form.keys()))
+    print("Content type:", request.content_type)
+    # Check if the post request has the file part
+    if 'image' not in request.files:
+        return jsonify({"error": "No file part"}), 400
     
-    print(f"Extracted Text: {extracted_text}")
+    file = request.files['image']
     
-    corrected_text = correct_text(extracted_text, ENHANCED_DICT)
-    print(f"Corrected Text: {corrected_text}")
+    # If user does not select file, browser might submit an empty part without filename
+    if file.filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    
+    if file and allowed_file(file.filename):
+        # Ensure upload directory exists
+        os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
+        
+        # Secure the filename and save temporarily
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        try:
+            # Process the image
+            reader = easyocr.Reader(['en'])
+            results = reader.readtext(file_path, detail=0)
+            extracted_text = ' '.join(results)
+            
+            print(f"Extracted Text: {extracted_text}")
+            
+            corrected_text = correct_text(extracted_text, ENHANCED_DICT)
+            print(f"Corrected Text: {corrected_text}")
 
-    # Auto-send to analysis
-    response = analyze_text(corrected_text)
-
-    return jsonify(response)
+            # Perform analysis
+            detected = detect_additives(corrected_text, ENHANCED_DICT)
+            analysis = analyze_additives(detected)
+            
+            response = {
+                "detected_additives": detected,
+                "analysis": analysis,
+                "extracted_text": extracted_text,
+                "corrected_text": corrected_text
+            }
+            
+            return jsonify(response)
+        except Exception as e:
+            return jsonify({"error": f"Error processing image: {str(e)}"}), 500
+        finally:
+            # Clean up - remove the uploaded file
+            if os.path.exists(file_path):
+                os.remove(file_path)
+    else:
+        return jsonify({"error": "Invalid file type"}), 400
 
 @app.route('/analyze', methods=['POST'])
-def analyze_text(text=None):
-    label_text = text if text else request.json.get("text")
+@cross_origin()
+def analyze_text():
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+        
+    label_text = request.json.get("text")
     if not label_text:
-        return {"error": "No text provided"}  # ✅ Return a dictionary
+        return jsonify({"error": "No text provided"}), 400
 
     detected = detect_additives(label_text, ENHANCED_DICT)
     analysis = analyze_additives(detected)
 
-    return {"detected_additives": detected, "analysis": analysis}
+    return jsonify({
+        "detected_additives": detected,
+        "analysis": analysis
+    })
 
 if __name__ == '__main__':
+    # Initialize data and create upload directory
     ADDATIVES_DF, ADDITIVES_DICT = clean_dataset(ADDATIVES_CSV)
     ENHANCED_DICT = preprocess_additives(ADDATIVES_DF)
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
     
-    app.run(debug=True)
+    app.run(debug=True, host='0.0.0.0', port=5000)

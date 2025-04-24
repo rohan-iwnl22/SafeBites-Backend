@@ -8,6 +8,15 @@ from flask import Flask, request, jsonify
 from fuzzywuzzy import process
 from flask_cors import CORS, cross_origin
 from werkzeug.utils import secure_filename
+import google.generativeai as genai
+from dotenv import load_dotenv
+
+load_dotenv()
+
+API_KEY = os.getenv("API_KEY")
+genai.configure(api_key=API_KEY)
+
+model = genai.GenerativeModel("gemini-2.0-flash")
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -117,6 +126,7 @@ def extract_text():
     print("Files in request:", list(request.files.keys()))
     print("Form data keys:", list(request.form.keys()))
     print("Content type:", request.content_type)
+    
     # Check if the post request has the file part
     if 'image' not in request.files:
         return jsonify({"error": "No file part"}), 400
@@ -151,16 +161,48 @@ def extract_text():
             detected = detect_additives(corrected_text, ENHANCED_DICT)
             analysis = analyze_additives(detected)
             
-            response = {
+            # Improved Gemini API call
+            prompt = f"""Analyze these food ingredients for safety according to FDA/WHO standards.
+            Respond with EXACTLY ONE WORD in lowercase - either 'safe' or 'unsafe'.
+            Ingredients: {corrected_text}"""
+            
+            response = model.generate_content(
+                prompt,
+                generation_config=genai.types.GenerationConfig(
+                    temperature=0.0,  # Makes responses more deterministic
+                    max_output_tokens=1,  # Forces single word response
+                    top_p=0.1
+                )
+            )
+            
+            # Process response more robustly
+            safe_unsafe = "unsafe"  # Default to unsafe if any error
+            if response.text:
+                clean_response = response.text.lower().strip()
+                if clean_response.startswith("safe"):
+                    safe_unsafe = "safe"
+                elif clean_response.startswith("unsafe"):
+                    safe_unsafe = "unsafe"
+                
+                print(f"Gemini raw response: {response.text}")
+                print(f"Processed safety: {safe_unsafe}")
+
+            response_data = {
                 "detected_additives": detected,
                 "analysis": analysis,
                 "extracted_text": extracted_text,
-                "corrected_text": corrected_text
+                "corrected_text": corrected_text,
+                "can_consume": safe_unsafe,
+                "safety_analysis": response.text if hasattr(response, 'text') else None
             }
             
-            return jsonify(response)
+            return jsonify(response_data)
         except Exception as e:
-            return jsonify({"error": f"Error processing image: {str(e)}"}), 500
+            print(f"Error in processing: {str(e)}")
+            return jsonify({
+                "error": f"Error processing image: {str(e)}",
+                "can_consume": "error"
+            }), 500
         finally:
             # Clean up - remove the uploaded file
             if os.path.exists(file_path):
